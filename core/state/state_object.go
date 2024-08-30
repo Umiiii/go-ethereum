@@ -114,14 +114,7 @@ func (s *stateObject) markSelfdestructed() {
 }
 
 func (s *stateObject) touch() {
-	s.db.journal.append(touchChange{
-		account: &s.address,
-	})
-	if s.address == ripemd {
-		// Explicitly put it in the dirty-cache, which is otherwise generated from
-		// flattened journals.
-		s.db.journal.dirty(s.address)
-	}
+	s.db.journal.touchChange(s.address)
 }
 
 // getTrie returns the associated storage trie. The trie will be opened if it's
@@ -239,6 +232,7 @@ func (s *stateObject) GetCommittedState(key common.Hash) common.Hash {
 		}
 	}
 	s.originStorage[key] = value
+	s.db.StorageLoaded++
 	return value
 }
 
@@ -251,16 +245,11 @@ func (s *stateObject) SetState(key, value common.Hash) {
 		return
 	}
 	// New value is different, update and journal the change
-	s.db.journal.append(storageChange{
-		account:   &s.address,
-		key:       key,
-		prevvalue: prev,
-		origvalue: origin,
-	})
+	s.db.journal.storageChange(s.address, key, prev, origin)
+	s.setState(key, value, origin)
 	if s.db.logger != nil && s.db.logger.OnStorageChange != nil {
 		s.db.logger.OnStorageChange(s.address, key, prev, value)
 	}
-	s.setState(key, value, origin)
 }
 
 // setState updates a value in account dirty storage. The dirtiness will be
@@ -323,11 +312,17 @@ func (s *stateObject) finalise() {
 //
 // It assumes all the dirty storage slots have been finalized before.
 func (s *stateObject) updateTrie() (Trie, error) {
-	// Short circuit if nothing changed, don't bother with hashing anything
+	// Short circuit if nothing was accessed, don't trigger a prefetcher warning
 	if len(s.uncommittedStorage) == 0 {
-		return s.trie, nil
+		// Nothing was written, so we could stop early. Unless we have both reads
+		// and witness collection enabled, in which case we need to fetch the trie.
+		if s.db.witness == nil || len(s.originStorage) == 0 {
+			return s.trie, nil
+		}
 	}
-	// Retrieve a pretecher populated trie, or fall back to the database
+	// Retrieve a pretecher populated trie, or fall back to the database. This will
+	// block until all prefetch tasks are done, which are needed for witnesses even
+	// for unmodified state objects.
 	tr := s.getPrefetchedTrie()
 	if tr != nil {
 		// Prefetcher returned a live trie, swap it out for the current one
@@ -340,6 +335,10 @@ func (s *stateObject) updateTrie() (Trie, error) {
 			s.db.setError(err)
 			return nil, err
 		}
+	}
+	// Short circuit if nothing changed, don't bother with hashing anything
+	if len(s.uncommittedStorage) == 0 {
+		return s.trie, nil
 	}
 	// Perform trie updates before deletions. This prevents resolution of unnecessary trie nodes
 	// in circumstances similar to the following:
@@ -500,10 +499,7 @@ func (s *stateObject) SubBalance(amount *uint256.Int, reason tracing.BalanceChan
 }
 
 func (s *stateObject) SetBalance(amount *uint256.Int, reason tracing.BalanceChangeReason) {
-	s.db.journal.append(balanceChange{
-		account: &s.address,
-		prev:    new(uint256.Int).Set(s.data.Balance),
-	})
+	s.db.journal.balanceChange(s.address, s.data.Balance)
 	if s.db.logger != nil && s.db.logger.OnBalanceChange != nil {
 		s.db.logger.OnBalanceChange(s.address, s.Balance().ToBig(), amount.ToBig(), reason)
 	}
@@ -579,14 +575,10 @@ func (s *stateObject) CodeSize() int {
 }
 
 func (s *stateObject) SetCode(codeHash common.Hash, code []byte) {
-	prevcode := s.Code()
-	s.db.journal.append(codeChange{
-		account:  &s.address,
-		prevhash: s.CodeHash(),
-		prevcode: prevcode,
-	})
+	s.db.journal.setCode(s.address)
 	if s.db.logger != nil && s.db.logger.OnCodeChange != nil {
-		s.db.logger.OnCodeChange(s.address, common.BytesToHash(s.CodeHash()), prevcode, codeHash, code)
+		// TODO remove prevcode from this callback
+		s.db.logger.OnCodeChange(s.address, common.BytesToHash(s.CodeHash()), nil, codeHash, code)
 	}
 	s.setCode(codeHash, code)
 }
@@ -598,10 +590,7 @@ func (s *stateObject) setCode(codeHash common.Hash, code []byte) {
 }
 
 func (s *stateObject) SetNonce(nonce uint64) {
-	s.db.journal.append(nonceChange{
-		account: &s.address,
-		prev:    s.data.Nonce,
-	})
+	s.db.journal.nonceChange(s.address, s.data.Nonce)
 	if s.db.logger != nil && s.db.logger.OnNonceChange != nil {
 		s.db.logger.OnNonceChange(s.address, s.data.Nonce, nonce)
 	}

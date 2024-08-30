@@ -196,7 +196,14 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		evm := vm.NewEVM(vmContext, vm.TxContext{}, statedb, chainConfig, vmConfig)
 		core.ProcessBeaconBlockRoot(*beaconRoot, evm, statedb)
 	}
-
+	if pre.Env.BlockHashes != nil && chainConfig.IsPrague(new(big.Int).SetUint64(pre.Env.Number), pre.Env.Timestamp) {
+		var (
+			prevNumber = pre.Env.Number - 1
+			prevHash   = pre.Env.BlockHashes[math.HexOrDecimal64(prevNumber)]
+			evm        = vm.NewEVM(vmContext, vm.TxContext{}, statedb, chainConfig, vmConfig)
+		)
+		core.ProcessParentBlockHash(prevHash, evm, statedb)
+	}
 	for i := 0; txIt.Next(); i++ {
 		tx, err := txIt.Tx()
 		if err != nil {
@@ -306,7 +313,9 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 				if tracer.Hooks.OnTxEnd != nil {
 					tracer.Hooks.OnTxEnd(receipt, nil)
 				}
-				writeTraceResult(tracer, traceOutput)
+				if err = writeTraceResult(tracer, traceOutput); err != nil {
+					log.Warn("Error writing tracer output", "err", err)
+				}
 			}
 		}
 
@@ -323,7 +332,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 		var (
 			blockReward = big.NewInt(miningReward)
 			minerReward = new(big.Int).Set(blockReward)
-			perOmmer    = new(big.Int).Div(blockReward, big.NewInt(32))
+			perOmmer    = new(big.Int).Rsh(blockReward, 5)
 		)
 		for _, ommer := range pre.Env.Ommers {
 			// Add 1/32th for each ommer included
@@ -332,7 +341,7 @@ func (pre *Prestate) Apply(vmConfig vm.Config, chainConfig *params.ChainConfig,
 			reward := big.NewInt(8)
 			reward.Sub(reward, new(big.Int).SetUint64(ommer.Delta))
 			reward.Mul(reward, blockReward)
-			reward.Div(reward, big.NewInt(8))
+			reward.Rsh(reward, 3)
 			statedb.AddBalance(ommer.Address, uint256.MustFromBig(reward), tracing.BalanceIncreaseRewardMineUncle)
 		}
 		statedb.AddBalance(pre.Env.Coinbase, uint256.MustFromBig(minerReward), tracing.BalanceIncreaseRewardMineBlock)

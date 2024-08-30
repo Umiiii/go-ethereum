@@ -69,6 +69,10 @@ func NewVerkleTrie(root common.Hash, db database.Database, cache *utils.PointCac
 	}, nil
 }
 
+func (t *VerkleTrie) FlatdbNodeResolver(path []byte) ([]byte, error) {
+	return t.reader.node(path, common.Hash{})
+}
+
 // GetKey returns the sha3 preimage of a hashed key that was previously used
 // to store a value.
 func (t *VerkleTrie) GetKey(key []byte) []byte {
@@ -144,10 +148,8 @@ func (t *VerkleTrie) UpdateAccount(addr common.Address, acc *types.StateAccount)
 
 	// Encode balance in little-endian
 	bytes := acc.Balance.Bytes()
-	if len(bytes) > 0 {
-		for i, b := range bytes {
-			balance[len(bytes)-i-1] = b
-		}
+	for i, b := range bytes {
+		balance[len(bytes)-i-1] = b
 	}
 	values[utils.BalanceLeafKey] = balance[:]
 
@@ -197,6 +199,42 @@ func (t *VerkleTrie) DeleteAccount(addr common.Address) error {
 		}
 	default:
 		return errInvalidRootType
+	}
+	return nil
+}
+
+// RollBackAccount removes the account info + code from the tree, unlike DeleteAccount
+// that will overwrite it with 0s. The first 64 storage slots are also removed.
+func (t *VerkleTrie) RollBackAccount(addr common.Address) error {
+	var (
+		evaluatedAddr = t.cache.Get(addr.Bytes())
+		codeSizeKey   = utils.CodeSizeKeyWithEvaluatedAddress(evaluatedAddr)
+	)
+	codeSizeBytes, err := t.root.Get(codeSizeKey, t.nodeResolver)
+	if err != nil {
+		return fmt.Errorf("rollback: error finding code size: %w", err)
+	}
+	if len(codeSizeBytes) == 0 {
+		return errors.New("rollback: code size is not existent")
+	}
+	codeSize := binary.LittleEndian.Uint64(codeSizeBytes)
+
+	// Delete the account header + first 64 slots + first 128 code chunks
+	_, err = t.root.(*verkle.InternalNode).DeleteAtStem(codeSizeKey[:31], t.nodeResolver)
+	if err != nil {
+		return fmt.Errorf("error rolling back account header: %w", err)
+	}
+
+	// Delete all further code
+	for i, chunknr := uint64(31*128), uint64(128); i < codeSize; i, chunknr = i+31*256, chunknr+256 {
+		// evaluate group key at the start of a new group
+		offset := uint256.NewInt(chunknr)
+		key := utils.CodeChunkKeyWithEvaluatedAddress(evaluatedAddr, offset)
+
+		_, err = t.root.(*verkle.InternalNode).DeleteAtStem(key[:], t.nodeResolver)
+		if err != nil {
+			return fmt.Errorf("error deleting code chunk stem (addr=%x, offset=%d) error: %w", addr[:], offset, err)
+		}
 	}
 	return nil
 }
@@ -267,6 +305,27 @@ func (t *VerkleTrie) Copy() *VerkleTrie {
 // IsVerkle indicates if the trie is a Verkle trie.
 func (t *VerkleTrie) IsVerkle() bool {
 	return true
+}
+
+// Proof builds and returns the verkle multiproof for keys, built against
+// the pre tree. The post tree is passed in order to add the post values
+// to that proof.
+func (t *VerkleTrie) Proof(posttrie *VerkleTrie, keys [][]byte, resolver verkle.NodeResolverFn) (*verkle.VerkleProof, verkle.StateDiff, error) {
+	var postroot verkle.VerkleNode
+	if posttrie != nil {
+		postroot = posttrie.root
+	}
+	proof, _, _, _, err := verkle.MakeVerkleMultiProof(t.root, postroot, keys, resolver)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	p, kvps, err := verkle.SerializeProof(proof)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return p, kvps, nil
 }
 
 // ChunkedCode represents a sequence of 32-bytes chunks of code (31 bytes of which
@@ -368,4 +427,9 @@ func (t *VerkleTrie) ToDot() string {
 
 func (t *VerkleTrie) nodeResolver(path []byte) ([]byte, error) {
 	return t.reader.node(path, common.Hash{})
+}
+
+// Witness returns a set containing all trie nodes that have been accessed.
+func (t *VerkleTrie) Witness() map[string]struct{} {
+	panic("not implemented")
 }
